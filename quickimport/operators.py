@@ -1,49 +1,265 @@
-
 import bpy #type: ignore
 import os
 from .modules.import_ops import QuickImportXXMIFrameAnalysis, QuickImport3DMigotoRaw
 from .texturehandling import TextureHandler, TextureHandler42
 from .preferences import *
 import re
+from typing import List, Optional, Set, Tuple
+from contextlib import contextmanager
+
+class ProcessingState:
+    def __init__(self, context):
+        self.context = context
+        self.original_selection = list(context.selected_objects)
+        self.imported_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        self.processed_objects = set()
+        self.created_collections = []
+        self.errors = []
+        
+    def add_error(self, operation: str, error: str):
+        self.errors.append(f"{operation}: {error}")
+        
+    def has_errors(self) -> bool:
+        return len(self.errors) > 0
+
+@contextmanager
+def safe_object_mode(context):
+    original_mode = context.mode
+    try:
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        yield
+    finally:
+        if original_mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode=original_mode)
+            except:
+                pass
+
+class MeshProcessor:
+    @staticmethod
+    def reset_rotation(objects: List[bpy.types.Object]) -> List[str]:
+        errors = []
+        for obj in objects:
+            try:
+                if obj and obj.type == 'MESH':
+                    obj.rotation_euler = (0, 0, 0)
+            except Exception as e:
+                errors.append(f"Failed to reset rotation for {obj.name}: {str(e)}")
+        return errors
+    
+    @staticmethod
+    def convert_to_quads(context, objects: List[bpy.types.Object]) -> List[str]:
+        errors = []
+        with safe_object_mode(context):
+            for obj in objects:
+                try:
+                    if obj and obj.type == 'MESH':
+                        context.view_layer.objects.active = obj
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        bpy.ops.mesh.select_all(action='SELECT')
+                        bpy.ops.mesh.tris_convert_to_quads(uvs=True, vcols=True, seam=True, sharp=True, materials=True)
+                        bpy.ops.mesh.delete_loose()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception as e:
+                    errors.append(f"Failed to convert to quads for {obj.name}: {str(e)}")
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except:
+                        pass
+        return errors
+    
+    @staticmethod
+    def merge_by_distance(context, objects: List[bpy.types.Object]) -> List[str]:
+        errors = []
+        with safe_object_mode(context):
+            for obj in objects:
+                try:
+                    if obj and obj.type == 'MESH':
+                        context.view_layer.objects.active = obj
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        bpy.ops.mesh.select_all(action='SELECT')
+                        bpy.ops.mesh.remove_doubles(use_sharp_edge_from_normals=True)
+                        bpy.ops.mesh.delete_loose()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception as e:
+                    errors.append(f"Failed to merge by distance for {obj.name}: {str(e)}")
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except:
+                        pass
+        return errors
+
+class MaterialProcessor:
+    @staticmethod
+    def setup_textures(context, objects: List[bpy.types.Object]) -> List[str]:
+        errors = []
+        with safe_object_mode(context):
+            try:
+                for obj in objects:
+                    if obj and obj.type == 'MESH':
+                        context.view_layer.objects.active = obj
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        bpy.ops.mesh.select_all(action='SELECT')
+                        bpy.ops.mesh.delete_loose()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.spaces.active.shading.type = 'MATERIAL'
+            except Exception as e:
+                errors.append(f"Failed to setup textures: {str(e)}")
+        return errors
+
+class CollectionManager:
+    @staticmethod
+    def create_collection(context, folder: str, objects: List[bpy.types.Object]) -> Tuple[Optional[bpy.types.Collection], List[str]]:
+        errors = []
+        try:
+            collection_name = os.path.basename(folder)
+            new_collection = bpy.data.collections.new(collection_name)
+            context.scene.collection.children.link(new_collection)
+
+            for obj in objects:
+                try:
+                    if obj and obj.name:
+                        collections_to_unlink = list(obj.users_collection) if obj.users_collection else []
+                        for coll in collections_to_unlink:
+                            if coll and obj.name in coll.objects:
+                                coll.objects.unlink(obj)
+                        new_collection.objects.link(obj)
+                except Exception as e:
+                    errors.append(f"Failed to move {obj.name} to collection: {str(e)}")
+            
+            return new_collection, errors
+        except Exception as e:
+            errors.append(f"Failed to create collection: {str(e)}")
+            return None, errors
+    
+    @staticmethod
+    def create_mesh_collection(context, folder: str, objects: List[bpy.types.Object]) -> Tuple[Optional[bpy.types.Collection], List[str]]:
+        errors = []
+        with safe_object_mode(context):
+            try:
+                collection_name = os.path.basename(folder)
+                new_collection = bpy.data.collections.new(collection_name + "_CustomProperties")
+                context.scene.collection.children.link(new_collection)
+                new_collection.color_tag = "COLOR_08"
+
+                for obj in objects:
+                    try:
+                        if not obj or obj.type == 'ARMATURE':
+                            continue
+                            
+                        if obj.users_collection and 'Face' in [c.name for c in obj.users_collection]:
+                            continue
+                            
+                        if not obj.name.startswith(collection_name):
+                            continue
+
+                        collections_to_unlink = [coll for coll in obj.users_collection if coll == context.scene.collection]
+                        for coll in collections_to_unlink:
+                            if obj.name in coll.objects:
+                                coll.objects.unlink(obj)
+                        
+                        new_collection.objects.link(obj)
+                        new_collection.hide_select = True
+
+                        name = obj.name.split(collection_name)[1].rsplit("-", 1)[0]
+                        new_sub_collection = bpy.data.collections.new(obj.name.rsplit("-", 1)[0])
+                        context.scene.collection.children.link(new_sub_collection)
+                        
+                        ob = bpy.data.objects.new(name=name, object_data=obj.data.copy())
+                        ob.location = obj.location
+                        ob.rotation_euler = obj.rotation_euler
+                        ob.scale = obj.scale
+                        new_sub_collection.objects.link(ob)
+
+                        if obj.type == 'MESH' and obj.data and obj.data.vertices:
+                            obj.data.clear_geometry()
+                            obj.name = obj.name.rsplit("-", 1)[0] + "-KeepEmpty"
+
+                        for mod in list(obj.modifiers):
+                            if mod.type == 'ARMATURE':
+                                new_mod = ob.modifiers.new(name="Armature", type='ARMATURE')
+                                new_mod.object = mod.object
+                                obj.modifiers.remove(mod)
+
+                    except Exception as e:
+                        errors.append(f"Failed to process mesh collection for {obj.name}: {str(e)}")
+
+                return new_collection, errors
+            except Exception as e:
+                errors.append(f"Failed to create mesh collection: {str(e)}")
+                return None, errors
 
 class QuickImportBase:
     def post_import_processing(self, context, folder):
-
+        state = ProcessingState(context)
         xxmi = context.scene.quick_import_settings
-        imported_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-
-        if xxmi.reset_rotation:
-            self.reset_rotation(context)
-
-        if xxmi.tri_to_quads:
-            self.convert_to_quads()
-
-        if xxmi.merge_by_distance:
-            self.merge_by_distance()
-
-        if xxmi.import_textures:
-            self.setup_textures(context)
-
-        if xxmi.create_collection:
-            self.create_collection(context, folder)
-
-        new_meshes = [obj for obj in imported_objects if obj.type == 'MESH']
         
-        print(f"New meshes detected: {[obj.name for obj in new_meshes]}")
-
-        if xxmi.import_textures:
-            self.assign_existing_materials(new_meshes)
-
-        if xxmi.import_face:
-            self.import_face(context)
-
-        if xxmi.import_armature:
-            self.import_armature(context)
+        try:
+            print(f"New meshes detected: {[obj.name for obj in state.imported_objects]}")
             
-        if xxmi.create_mesh_collection:
-            self.create_mesh_collection(context, folder)
-      
-        bpy.ops.object.select_all(action='DESELECT')
+            if xxmi.reset_rotation:
+                errors = MeshProcessor.reset_rotation(state.original_selection)
+                for error in errors:
+                    state.add_error("Reset Rotation", error)
+
+            if xxmi.tri_to_quads:
+                errors = MeshProcessor.convert_to_quads(context, state.original_selection)
+                for error in errors:
+                    state.add_error("Convert to Quads", error)
+
+            if xxmi.merge_by_distance:
+                errors = MeshProcessor.merge_by_distance(context, state.original_selection)
+                for error in errors:
+                    state.add_error("Merge by Distance", error)
+
+            if xxmi.import_textures:
+                errors = MaterialProcessor.setup_textures(context, state.original_selection)
+                for error in errors:
+                    state.add_error("Setup Textures", error)
+
+            if xxmi.import_textures:
+                self.assign_existing_materials(state.imported_objects)
+
+            if xxmi.import_face:
+                self.import_face(context)
+
+            if xxmi.import_armature:
+                self.import_armature(context)
+
+            if xxmi.create_collection:
+                collection, errors = CollectionManager.create_collection(context, folder, state.original_selection)
+                if collection:
+                    state.created_collections.append(collection)
+                for error in errors:
+                    state.add_error("Create Collection", error)
+                
+            if xxmi.create_mesh_collection:
+                collection, errors = CollectionManager.create_mesh_collection(context, folder, state.original_selection)
+                if collection:
+                    state.created_collections.append(collection)
+                for error in errors:
+                    state.add_error("Create Mesh Collection", error)
+            
+            if state.has_errors():
+                print("Processing completed with errors:")
+                for error in state.errors:
+                    print(f"  - {error}")
+            else:
+                print("Processing completed successfully")
+                
+        except Exception as e:
+            print(f"Critical error during processing: {str(e)}")
+            state.add_error("Critical", str(e))
+        
+        finally:
+            try:
+                bpy.ops.object.select_all(action='DESELECT')
+            except:
+                pass
         
     def assign_existing_materials(self, new_meshes):
         for obj in new_meshes:
@@ -119,105 +335,6 @@ class QuickImportBase:
 
         return None
            
-    def create_collection(self, context, folder):
-        collection_name = os.path.basename(folder)
-        new_collection = bpy.data.collections.new(collection_name)
-        bpy.context.scene.collection.children.link(new_collection)
-
-        for obj in bpy.context.selected_objects:
-            if obj.users_collection:  
-                for coll in obj.users_collection:
-                    coll.objects.unlink(obj)
-            new_collection.objects.link(obj)
-            print(f"Moved {obj.name} to collection {collection_name}")
-
-    def create_mesh_collection(self, context, folder):
-        #Sins logic for collections with custom properties, 
-        # I will probably change this to don't use bmesh in futurec
-        import bmesh #type: ignore
-        collection_name = os.path.basename(folder)
-        new_collection = bpy.data.collections.new(collection_name+"_CustomProperties")
-        bpy.context.scene.collection.children.link(new_collection)
-        new_collection.color_tag = "COLOR_08"
-
-        selected_objects = [obj for obj in bpy.context.selected_objects]
-        for obj in selected_objects:
-            # Skip if object is an armature or in Face collection
-            if obj.type == 'ARMATURE' or (obj.users_collection and 'Face' in [c.name for c in obj.users_collection]):
-                print(f"Skipping {obj.name} as it is an armature or face mesh")
-                continue
-
-            if obj.name.startswith(collection_name):
-                bpy.ops.object.mode_set(mode='OBJECT')
-                bpy.context.scene.collection.objects.unlink(obj)
-                new_collection.objects.link(obj)
-                new_collection.hide_select = True
-
-                try:
-                    #duplicate data to new containers in collections
-                    name = obj.name.split(collection_name)[1].rsplit("-", 1)[0]
-                    new_sub_collection = bpy.data.collections.new(obj.name.rsplit("-", 1)[0])
-                    bpy.context.scene.collection.children.link(new_sub_collection)
-                    ob = bpy.data.objects.new(name = name, object_data = obj.data.copy())
-                    ob.location = obj.location
-                    ob.rotation_euler = obj.rotation_euler
-                    ob.scale = obj.scale
-                    new_sub_collection.objects.link(ob)
-
-                    #Del verts of imported containers
-                    if obj.type == 'MESH':
-                        bm = bmesh.new()
-                        bm.from_mesh(obj.data)
-                        [bm.verts.remove(v) for v in bm.verts]
-                        bm.to_mesh(obj.data)
-                        obj.data.update()
-                        bm.free()
-                        print(f"Moved {obj.name} to collection {name} as {ob.name}.")
-                        obj.name = obj.name.rsplit("-", 1)[0] + "-KeepEmpty"
-                        print(f"{obj.name} maintains custom properties, don't delete.")
-
-                        # Move any existing armature modifiers from the empty to the new mesh
-                        for mod in obj.modifiers:
-                            if mod.type == 'ARMATURE':
-                                new_mod = ob.modifiers.new(name="Armature", type='ARMATURE')
-                                new_mod.object = mod.object
-                                obj.modifiers.remove(mod)
-                    else:
-                        print(f"Skipping vertex removal for non-mesh object {obj.name}")
-
-                except IndexError:
-                    print(f"Failed on {obj.name} as it does not contain collection name")
-            else:
-                print(f"Ignored {obj.name} as it does not match the collection name")
-
-    def reset_rotation(self, context):
-        for obj in context.selected_objects:
-            if obj.name in [o.name for o in bpy.context.selected_objects]:
-                obj.rotation_euler = (0, 0, 0)
-
-    def convert_to_quads(self):
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.tris_convert_to_quads(uvs=True, vcols=True, seam=True, sharp=True, materials=True)
-        bpy.ops.mesh.delete_loose()
-
-    def merge_by_distance(self):
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.remove_doubles(use_sharp_edge_from_normals=True)
-        bpy.ops.mesh.delete_loose()
-
-    def setup_textures(self, context):
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.delete_loose()
-        bpy.ops.object.mode_set(mode='OBJECT')
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.spaces.active.shading.type = 'MATERIAL'
-        
-        # if bpy.app.version >= (4, 2, 0):
-        #     bpy.data.scenes["Scene"].view_settings.view_transform = 'Khronos PBR Neutral'
 
     def import_armature(self, context):
         try:
@@ -230,7 +347,7 @@ class QuickImportBase:
                 if obj.type == 'MESH'
                 and not any(col.name == 'Face' for col in obj.users_collection)
                 and '-KeepEmpty' not in obj.name
-                and not any(head in obj.name for head in ['HeadA', 'HeadB'])
+                and not any(head in obj.name for head in ['HeadA', 'HeadB', 'EyesA', 'EyesB', 'Eyes' , 'EyeA', "Eye"])
             ]
 
             if not body_objects:
@@ -252,26 +369,47 @@ class QuickImportBase:
             if not imported_armatures:
                 raise Exception("No armatures found in imported objects")
 
-            # Step 6: Match each mesh to the most appropriate armature
-            for obj in body_objects:
-                # Extract base name for matching
-                obj_base_name = obj.name.split('-')[0].split('=')[0].lower()
+            # Step 6: Set armature scales ONCE based on flip_mesh setting
+            for armature in imported_armatures:
+                if context.scene.quick_import_settings.flip_mesh:
+                    armature.scale = (1, 1, 1)
+                else:
+                    armature.scale = (-1, 1, 1)
 
-                # Find the best matching armature dynamically
+            # Step 7: Match each mesh to the most appropriate armature
+            for obj in body_objects:
+                obj_name = obj.name.split('-')[0].split('=')[0].lower()
+                
                 best_match = None
                 best_score = 0
+                
+                # Try to find exact part match first
                 for armature in imported_armatures:
-                    # Set armature scale based on flip_mesh setting
-                    if context.scene.quick_import_settings.flip_mesh:
-                        armature.scale = (1, 1, 1)
-                    else:
-                        armature.scale = (-1, 1, 1)
+                    armature_clean = armature.name.lower().replace('_armature', '').replace('_', '')
+                    
+                    # Check if armature contains specific parts that match the object
+                    for part in sorted(COMMON_PARTS, key=len, reverse=True):
+                        part_lower = part.lower()
+                        if part_lower in obj_name and part_lower in armature_clean:
+                            # Found specific part match
+                            score = len(part_lower) * 100  # High priority for part matches
+                            if score > best_score:
+                                best_match = armature
+                                best_score = score
+                                break
+                
+                # If no specific part match, try general character match
+                if not best_match:
+                    for armature in imported_armatures:
+                        armature_clean = armature.name.lower().replace('_armature', '').replace('_', '')
                         
-                    armature_base = armature.name.replace('_', '').lower()
-                    score = sum(1 for char in obj_base_name if char in armature_base)
-                    if score > best_score:
-                        best_match = armature
-                        best_score = score
+                        # Check if it's a general armature (no specific parts)
+                        has_parts = any(part.lower() in armature_clean for part in COMMON_PARTS)
+                        if not has_parts and armature_clean in obj_name:
+                            score = len(armature_clean)
+                            if score > best_score:
+                                best_match = armature
+                                best_score = score
 
                 if best_match:
                     # Check if armature modifier already exists
@@ -377,7 +515,7 @@ CHARACTER_NAME_MAPPING = {
 }
 
 COMMON_PARTS = ['PonyTail', 'Body', 'Head', 'Arm', 'Leg', 'Dress', 'Extra', 'Extras', 'Hair', 'Mask', 'Idle', 'Eyes', 'Coat', 'JacketHead', 'JacketBody', 'Jacket',
-'Hat', 'HatHead', 'HatBody', 'BackHair', 'Wings']
+'Hat', 'HatHead', 'HatBody', 'BackHair', 'Wings', 'Bang', 'Bangs']
 
 
 class QuickImportArmature(bpy.types.Operator):
@@ -484,37 +622,6 @@ class QuickImportArmature(bpy.types.Operator):
                     
             if not armature_found:
                 print(f"Warning: No matching armature file found for {base_name} in either GI or HSR directories")
-
-
-class QuickImportRaw(QuickImport3DMigotoRaw, QuickImportBase):
-    """Setup Character file with raw data .IB + .VB"""
-    bl_idname = "import_scene.3dmigoto_raw"
-    bl_label = "Quick Import Raw for XXMI"
-    bl_options = {"UNDO"}
-
-    def execute(self, context):
-        result = super().execute(context)
-        if result != {"FINISHED"}:
-            return result
-        
-        folder = os.path.dirname(self.properties.filepath)
-        print("------------------------")
-
-        print(f"Found Folder: {folder}")
-        files = os.listdir(folder)
-        files = [f for f in files if f.endswith("Diffuse.dds")]
-        print(f"List of files: {files}")
-
-        if bpy.app.version < (4, 2, 0):
-            importedmeshes = TextureHandler.create_material(context, files, folder)
-        else:
-            importedmeshes = TextureHandler42.create_material(context, files, folder)
-
-        print(f"Imported meshes: {[obj.name for obj in importedmeshes]}")
-
-        self.post_import_processing(context, folder)
-
-        return {"FINISHED"}
                    
 class QuickImportFace(bpy.types.Operator):
     bl_idname = "import_scene.face_file"
@@ -639,6 +746,37 @@ class QuickImport(QuickImportXXMIFrameAnalysis, QuickImportBase):
 
         return {"FINISHED"}
     
+class QuickImportRaw(QuickImport3DMigotoRaw, QuickImportBase):
+    """Setup Character file with raw data .IB + .VB"""
+    bl_idname = "import_scene.3dmigoto_raw"
+    bl_label = "Quick Import Raw for XXMI"
+    bl_options = {"UNDO"}
+
+    def execute(self, context):
+        cfg = context.scene.quick_import_settings
+        self.flip_mesh = cfg.flip_mesh
+        super().execute(context)
+
+        
+        folder = os.path.dirname(self.properties.filepath)
+        print("------------------------")
+
+        print(f"Found Folder: {folder}")
+        files = os.listdir(folder)
+        files = [f for f in files if f.endswith("Diffuse.dds")]
+        print(f"List of files: {files}")
+
+        if bpy.app.version < (4, 2, 0):
+            importedmeshes = TextureHandler.create_material(context, files, folder)
+        else:
+            importedmeshes = TextureHandler42.create_material(context, files, folder)
+
+        print(f"Imported meshes: {[obj.name for obj in importedmeshes]}")
+
+        self.post_import_processing(context, folder)
+
+        return {"FINISHED"}    
+        
 class SavePreferencesOperator(bpy.types.Operator):
     bl_idname = "quickimport.save_preferences"
     bl_label = "Save Import Settings"
