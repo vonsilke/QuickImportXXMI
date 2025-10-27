@@ -176,7 +176,13 @@ class CollectionManager:
                         new_sub_collection.objects.link(ob)
 
                         if obj.type == 'MESH' and obj.data and obj.data.vertices:
-                            obj.data.clear_geometry()
+                            import bmesh #type: ignore
+                            bm = bmesh.new()
+                            bm.from_mesh(obj.data)
+                            [bm.verts.remove(v) for v in bm.verts]
+                            bm.to_mesh(obj.data)
+                            obj.data.update()
+                            bm.free()
                             obj.name = obj.name.rsplit("-", 1)[0] + "-KeepEmpty"
 
                         for mod in list(obj.modifiers):
